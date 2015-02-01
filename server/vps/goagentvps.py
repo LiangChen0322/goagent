@@ -24,111 +24,40 @@ logging.basicConfig(level=logging.INFO, format='%(levelname)s - %(asctime)s %(me
 import socket
 import errno
 import ssl
-import select
+import hashlib
 import hmac
 import struct
-import zlib
 
+import OpenSSL
 import gevent
 import gevent.server
 
 
-class CipherFileObject(object):
-    """fileobj wrapper for cipher"""
-    def __init__(self, fileobj, cipher, mode='r'):
-        self.__fileobj = fileobj
-        self.__cipher = cipher
-        if 'r' not in mode:
-            self.read = self.__fileobj.read
-        if 'w' not in mode:
-            self.write = self.__fileobj.write
-
-    def __getattr__(self, attr):
-        if attr not in ('__fileobj', '__cipher'):
-            return getattr(self.__fileobj, attr)
-
-    def read(self, size=-1):
-        return self.__cipher.encrypt(self.__fileobj.read(size))
-
-    def write(self, data):
-        return self.__fileobj.write(self.__cipher.encrypt(data))
+from proxylib import forward_socket
+from proxylib import inflate
+from proxylib import random_hostname
+from proxylib import SSLConnection
+from proxylib import CertUtility
+from proxylib import RC4Socket
 
 
-class RC4Socket(object):
-    """socket wrapper for cipher"""
-    def __init__(self, sock, key):
-        from Crypto.Cipher.ARC4 import new as RC4Cipher
-        self.__sock = sock
-        self.__key = key
-        self.__recv_cipher = RC4Cipher(key)
-        self.__send_cipher = RC4Cipher(key)
-
-    def __getattr__(self, attr):
-        if attr not in ('__sock', '__cipher'):
-            return getattr(self.__sock, attr)
-
-    def recv(self, size):
-        data = self.__sock.recv(size)
-        return data and self.__recv_cipher.encrypt(data)
-
-    def send(self, data, flags=0):
-        return data and self.__sock.send(self.__send_cipher.encrypt(data), flags)
-
-    def dup(self):
-        return RC4Socket(self.__sock.dup(), self.__key)
-
-    def makefile(self, mode, bufsize):
-        cipher = None
-        if 'r' in mode:
-            cipher = self.__recv_cipher
-        if 'w' in mode:
-            cipher = self.__send_cipher
-        return CipherFileObject(self.__sock.makefile(mode, bufsize), cipher, mode)
+def readn(sock, n):
+    buf = ''
+    while n > 0:
+        data = sock.recv(n)
+        if not data:
+            raise socket.error(errno.EPIPE, 'Unexpected EOF')
+        n -= len(data)
+        buf += data
+    return buf
 
 
-def inflate(data):
-    return zlib.decompress(data, -zlib.MAX_WBITS)
-
-
-def deflate(data):
-    return zlib.compress(data)[2:-4]
-
-
-def forward_socket(local, remote, timeout, bufsize):
-    """forward socket"""
-    try:
-        tick = 1
-        timecount = timeout
-        while 1:
-            timecount -= tick
-            if timecount <= 0:
-                break
-            (ins, _, errors) = select.select([local, remote], [], [local, remote], tick)
-            if errors:
-                break
-            for sock in ins:
-                data = sock.recv(bufsize)
-                if not data:
-                    break
-                if sock is remote:
-                    local.sendall(data)
-                    timecount = timeout
-                else:
-                    remote.sendall(data)
-                    timecount = timeout
-    except socket.timeout:
-        pass
-    except (socket.error, ssl.SSLError) as e:
-        if e.args[0] not in (errno.ECONNABORTED, errno.ECONNRESET, errno.ENOTCONN, errno.EPIPE):
-            raise
-        if e.args[0] in (errno.EBADF,):
-            return
-    finally:
-        for sock in (remote, local):
-            try:
-                sock.close()
-            except StandardError:
-                pass
+def generate_openssl_context(server_name):
+    key, ca = CertUtility(server_name, '', '').create_ca()
+    context = OpenSSL.SSL.Context(OpenSSL.SSL.TLSv1_METHOD)
+    context.use_certificate(ca)
+    context.use_privatekey(key)
+    return context
 
 
 class TCPServer(gevent.server.StreamServer):
@@ -137,23 +66,13 @@ class TCPServer(gevent.server.StreamServer):
         self.password = kwargs.pop('password')
         gevent.server.StreamServer.__init__(self, *args, **kwargs)
 
-    def readn(self, sock, n):
-        buf = ''
-        while n > 0:
-            data = sock.recv(n)
-            if not data:
-                raise socket.error(errno.EPIPE, 'Unexpected EOF')
-            n -= len(data)
-            buf += data
-        return buf
-
     def handle(self, sock, address):
-        seed = self.readn(sock, int(hashlib.md5(self.password).hexdigest(), 16) % 11)
+        seed = readn(sock, int(hashlib.md5(self.password).hexdigest(), 16) % 11)
         digest = hmac.new(self.password, seed).digest()
         csock = RC4Socket(sock, digest)
-        domain = self.readn(csock, ord(self.readn(csock, 1)))
-        port, = struct.unpack('>H', self.readn(csock, 2))
-        flag = ord(self.readn(csock, 1))
+        domain = readn(csock, ord(readn(csock, 1)))
+        port, = struct.unpack('>H', readn(csock, 2))
+        flag = ord(readn(csock, 1))
         data = ''
         do_ssl_handshake = False
         if flag & 0x1:
@@ -161,8 +80,8 @@ class TCPServer(gevent.server.StreamServer):
         if flag & 0x2:
             do_ssl_handshake = True
         if flag & 0x4:
-            datasize, = struct.unpack('>H', self.readn(csock, 2))
-            data = self.readn(csock, datasize)
+            datasize, = struct.unpack('>H', readn(csock, 2))
+            data = readn(csock, datasize)
             if flag & 0x8:
                 data = inflate(data)
         remote = socket.create_connection((domain, port), timeout=8)
@@ -173,13 +92,52 @@ class TCPServer(gevent.server.StreamServer):
         forward_socket(csock, remote, timeout=60, bufsize=256*1024)
 
 
+class TLSServer(gevent.server.StreamServer):
+    """VPS tcp server"""
+    def __init__(self, *args, **kwargs):
+        self.password = kwargs.pop('password')
+        self.ssl_context = generate_openssl_context(random_hostname())
+        gevent.server.StreamServer.__init__(self, *args, **kwargs)
+
+    def handle(self, sock, address):
+        ssl_sock = SSLConnection(self.ssl_context, sock)
+        ssl_sock.set_accept_state()
+        ssl_sock.do_handshake()
+        password = readn(ssl_sock, len(self.password))
+        if password != self.password:
+            logging.info("%r send wrong password=%r", address, password)
+            ssl_sock.sendall('HTTP/1.1 200 OK\r\n\r\n')
+            ssl_sock.close()
+            return
+        domain = readn(ssl_sock, ord(readn(ssl_sock, 1)))
+        port, = struct.unpack('>H', readn(ssl_sock, 2))
+        flag = ord(readn(ssl_sock, 1))
+        data = ''
+        do_ssl_handshake = False
+        if flag & 0x1:
+            raise ValueError('Now UDP is unsupported')
+        if flag & 0x2:
+            do_ssl_handshake = True
+        if flag & 0x4:
+            datasize, = struct.unpack('>H', readn(ssl_sock, 2))
+            data = readn(ssl_sock, datasize)
+            if flag & 0x8:
+                data = inflate(data)
+        remote = socket.create_connection((domain, port), timeout=8)
+        if do_ssl_handshake:
+            remote = ssl.SSLSocket(remote)
+        if data:
+            remote.sendall(data)
+        forward_socket(ssl_sock, remote, timeout=60, bufsize=256*1024)
+
+
 def main():
     global __file__
     __file__ = os.path.abspath(__file__)
     if os.path.islink(__file__):
         __file__ = getattr(os, 'readlink', lambda x: x)(__file__)
     os.chdir(os.path.dirname(os.path.abspath(__file__)))
-    server = TCPServer(('', 3389), password='123456')
+    server = TLSServer(('', 443), password='123456')
     server.serve_forever()
 
 
