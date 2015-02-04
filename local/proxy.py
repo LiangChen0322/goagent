@@ -874,10 +874,8 @@ class VPSFetchPlugin(BaseFetchPlugin):
         forward_socket(sock, handler.connection, bufsize=256*1024, timeout=60)
 
     def handle_method(self, handler, **kwargs):
-        method = handler.command
-        url = handler.path
         headers = dict((k.title(), v) for k, v in handler.headers.items() if k.title() not in handler.net2.skip_headers)
-        payload = deflate('%s %s %s\r\n%s' % (method, url, handler.request_version, ''.join('%s: %s\r\n' % (k, v) for k, v in headers.items())))
+        payload = '%s %s %s\r\n%s\r\n' % (handler.command, urlparse.urlsplit(handler.path).path, handler.request_version, ''.join('%s: %s\r\n' % (k, v) for k, v in headers.items()))
         sock = self._create_remote_connection((handler.host, handler.port), 8)
         if handler.body:
             payload += handler.body
@@ -890,13 +888,27 @@ class VPSFetchPlugin(BaseFetchPlugin):
             response.fp = sock.makefile('rb')
         try:
             response.begin()
-            logging.info('%s "VPS %s %s %s" %s %s', handler.address_string(), handler.command, url, handler.protocol_version, response.status, response.getheader('Content-Length', '-'))
-            handler.close_connection = bool(response.getheader('Transfer-Encoding'))
+            logging.info('%s "VPS %s %s %s" %s %s', handler.address_string(), handler.command, handler.path, handler.protocol_version, response.status, response.getheader('Content-Length', '-'))
+            need_chunked = bool(response.getheader('Transfer-Encoding'))
+            handler.send_response(response.status)
+            for key, value in response.getheaders():
+                if (key.title(), value.lower()) == ('Connection', 'close'):
+                    handler.send('Transfer-Encoding', 'chunked')
+                    need_chunked = True
+                else:
+                    handler.send_header(key, value)
+            handler.end_headers()
             while True:
                 data = response.read(8192)
                 if not data:
+                    if need_chunked:
+                        handler.wfile.write('0\r\n\r\n')
                     break
+                if need_chunked:
+                    handler.wfile.write('%x\r\n' % len(data))
                 handler.wfile.write(data)
+                if need_chunked:
+                    handler.wfile.write('\r\n')
                 del data
         except Exception as e:
             logging.exception('%s VPS handle error: %r', e)
