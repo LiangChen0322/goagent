@@ -198,7 +198,6 @@ from proxylib import LocalProxyServer
 from proxylib import message_html
 from proxylib import MockFetchPlugin
 from proxylib import AdvancedNet2
-from proxylib import Net2
 from proxylib import ProxyNet2
 from proxylib import ProxyUtil
 from proxylib import RC4Cipher
@@ -792,7 +791,7 @@ class VPSFetchPlugin(BaseFetchPlugin):
     def __init__(self, servers):
         BaseFetchPlugin.__init__(self)
         ServerTuple = collections.namedtuple('server', 'mode password host port')
-        self.servers = {}
+        self.servers = []
         for server in servers:
             mode, password, _, hostport = urllib2._parse_proxy(server)
             assert mode in ('tcp', 'http', 'https', 'dtls')
@@ -803,7 +802,7 @@ class VPSFetchPlugin(BaseFetchPlugin):
             else:
                 host = hostport
                 port = {'tcp': 3389, 'http': 80, 'https':443, 'dtls': 443}[mode]
-            self.servers[(host, port)] = ServerTuple(mode=mode, password=password, host=host, port=port)
+            self.servers.append(ServerTuple(mode=mode, password=password, host=host, port=port))
 
     def handle(self, handler, **kwargs):
         if handler.command == 'CONNECT':
@@ -812,16 +811,18 @@ class VPSFetchPlugin(BaseFetchPlugin):
             self.handle_method(handler, **kwargs)
 
     def _create_server_connection(self, timeout):
-        def create_connection(ipaddr, queobj):
-            sock = None
+        def create_connection(server, queobj):
             sock = None
             try:
-                sock = socket.socket(socket.AF_INET if ':' not in ipaddr[0] else socket.AF_INET6)
+                sock = socket.socket(socket.AF_INET if ':' not in server.host else socket.AF_INET6)
                 sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
                 sock.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack('ii', 1, 0))
                 sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 32*1024)
-                sock.settimeout(time)
-                sock.connect(ipaddr)
+                sock.settimeout(timeout)
+                sock.connect((server.host, server.port))
+                if server.mode in ('tls', 'ssl'):
+                    sock = ssl.wrap_socket(sock)
+                sock.server = server
                 queobj.put(sock)
             except (socket.error, ssl.SSLError, OSError) as e:
                 queobj.put(e)
@@ -833,79 +834,74 @@ class VPSFetchPlugin(BaseFetchPlugin):
                 if sock and hasattr(sock, 'getpeername'):
                     sock.close()
         sock = None
-        for i in range(kwargs.get('max_retry', 2)):
+        servers = self.servers
+        for i in range(2):
             queobj = Queue.Queue()
-            addrs = [(x.host, x.port) for x in self.servers.values()]
-            for addr in addrs:
-                thread.start_new_thread(create_connection, (addr, queobj))
-            for i in range(len(addrs)):
+            for server in servers:
+                thread.start_new_thread(create_connection, (server, queobj))
+            for i in range(len(servers)):
                 sock = queobj.get()
                 if hasattr(sock, 'getpeername'):
-                    spawn_later(0.01, close_connection, len(addrs)-i-1, queobj)
+                    spawn_later(0.01, close_connection, len(servers)-i-1, queobj)
                     return sock
                 elif i == 0:
-                    # only output first error
-                    logging.warning('_create_server_connection to %r with %s return %r, try again.', hostname, addrs, sock)
+                    logging.warning('_create_server_connection to %s return %r, try again.', servers, sock)
         if not hasattr(sock, 'getpeername'):
             raise sock
 
+    def _create_remote_connection(self, (host, port), timeout):
+        sock = self._create_server_connection(timeout)
+        server = sock.server
+        if server.mode in ('ssl', 'tls'):
+            data = server.password + chr(len(host)) + host + struct.pack('>H', port) + '\x00'
+            sock.send(data)
+        elif server.mode == 'tcp':
+            seed = os.urandom(int(hashlib.md5(server.password).hexdigest(), 16) % 11)
+            sock.send(seed)
+            sock = RC4Socket(sock, hmac.new(server.password, seed).digest())
+            data = chr(len(host)) + host + struct.pack('>H', port) + '\x00'
+            sock.send(data)
+        elif server.mode == 'http':
+            #TODO, refer to obfsproxy
+            pass
+        else:
+            raise ValueError('vps server=%s mode %r is unsupported' % (server, server.mode))
+        return sock
+
     def handle_connect(self, handler, **kwargs):
-        host, port = handler.host, handler.port
-        sock = self._create_server_connection(8)
-        server = self.servers[sock.getpeername()]
-        assert server.mode == 'tcp', 'please use tcp mode'
-        seed = os.urandom(int(hashlib.md5(server.password).hexdigest(), 16) % 11)
-        digest = hmac.new(self.password, seed).digest()
-        csock = RC4Socket(sock, digest)
-        data = chr(len(host)) + host + struct.pack('>H', len(port)) + '\x00'
-        csock.send(data)
+        sock = self._create_remote_connection((handler.host, handler.port), 8)
         handler.connection.send('HTTP/1.1 200 OK\r\n\r\n')
-        forward_socket(csock, handler.connection)
+        forward_socket(sock, handler.connection, bufsize=256*1024, timeout=60)
 
     def handle_method(self, handler, **kwargs):
         method = handler.command
         url = handler.path
-        headers = dict((k.title(), v) for k, v in handler.headers.items())
-        body = handler.body
-        if body:
-            if len(body) < 10 * 1024 * 1024 and 'Content-Encoding' not in headers:
-                zbody = deflate(body)
-                if len(zbody) < len(body):
-                    body = zbody
-                    headers['Content-Encoding'] = 'deflate'
-            headers['Content-Length'] = str(len(body))
-        skip_headers = handler.net2.skip_headers
-        if self.password:
-            kwargs['password'] = self.password
-        if self.validate:
-            kwargs['validate'] = self.validate
-        payload = '%s %s %s\r\n' % (method, url, handler.request_version)
-        payload += ''.join('%s: %s\r\n' % (k, v) for k, v in headers.items() if k not in handler.net2.skip_headers)
-        payload += ''.join('X-URLFETCH-%s: %s\r\n' % (k, v) for k, v in kwargs.items() if v)
-        payload = deflate(payload)
-        body = '%s%s%s' % ((struct.pack('!h', len(payload)), payload, body))
-        request_headers = {'Content-Length': len(body), 'Content-Type': 'application/octet-stream'}
-        fetchserver_index = 0 if 'Range' not in headers else random.randint(0, len(self.fetchservers)-1)
-        fetchserver = '%s?%s' % (self.fetchservers[fetchserver_index], random.random())
-        crlf = 0
-        cache_key = '%s//:%s' % urlparse.urlsplit(fetchserver)[:2]
+        headers = dict((k.title(), v) for k, v in handler.headers.items() if k.title() not in handler.net2.skip_headers)
+        payload = deflate('%s %s %s\r\n%s' % (method, url, handler.request_version, ''.join('%s: %s\r\n' % (k, v) for k, v in headers.items())))
+        sock = self._create_remote_connection((handler.host, handler.port), 8)
+        if handler.body:
+            payload += handler.body
+        sock.send(payload)
+        if sys.version[:3] == '2.7':
+            response = httplib.HTTPResponse(sock, buffering=True)
+        else:
+            response = httplib.HTTPResponse(sock)
+            response.fp.close()
+            response.fp = sock.makefile('rb')
         try:
-            response = handler.net2.create_http_request('POST', fetchserver, request_headers, body, handler.net2.connect_timeout, crlf=crlf, cache_key=cache_key)
+            response.begin()
+            logging.info('%s "VPS %s %s %s" %s %s', handler.address_string(), handler.command, url, handler.protocol_version, response.status, response.getheader('Content-Length', '-'))
+            handler.close_connection = bool(response.getheader('Transfer-Encoding'))
+            while True:
+                data = response.read(8192)
+                if not data:
+                    break
+                handler.wfile.write(data)
+                del data
         except Exception as e:
-            logging.warning('%s "%s" failed %r', method, url, e)
-            return
-        response.app_status = response.status
-        need_decrypt = self.password and response.app_status == 200 and response.getheader('Content-Type', '') == 'image/gif' and response.fp
-        if need_decrypt:
-            response.fp = CipherFileObject(response.fp, XORCipher(self.password[0]))
-        logging.info('%s "PHP %s %s %s" %s %s', handler.address_string(), handler.command, url, handler.protocol_version, response.status, response.getheader('Content-Length', '-'))
-        handler.close_connection = bool(response.getheader('Transfer-Encoding'))
-        while True:
-            data = response.read(8192)
-            if not data:
-                break
-            handler.wfile.write(data)
-            del data
+            logging.exception('%s VPS handle error: %r', e)
+        finally:
+            response.begin()
 
 
 class VPSFetchFilter(BaseProxyHandlerFilter):
@@ -916,25 +912,12 @@ class VPSFetchFilter(BaseProxyHandlerFilter):
 
 class VPSProxyHandler(SimpleProxyHandler):
     """VPS Proxy Handler"""
-    handler_filters = [PHPFetchFilter()]
+    handler_filters = [VPSFetchFilter()]
     handler_plugins = {'direct': DirectFetchPlugin(),
                        'mock': MockFetchPlugin(),}
 
     def __init__(self, *args, **kwargs):
         SimpleProxyHandler.__init__(self, *args, **kwargs)
-
-    def first_run(self):
-        """VPSProxyHandler setup, init domain/iplist map"""
-        if not common.PROXY_ENABLE:
-            hostname = urlparse.urlsplit(common.PHP_FETCHSERVER).hostname
-            net2 = AdvancedNet2(window=4, ssl_version='TLSv1', dns_servers=common.DNS_SERVERS, dns_blacklist=common.DNS_BLACKLIST)
-            if not common.PHP_HOSTS:
-                common.PHP_HOSTS = net2.gethostsbyname(hostname)
-            net2.enable_connection_cache()
-            if common.PHP_KEEPALIVE:
-                net2.enable_connection_keepalive()
-            net2.enable_openssl_session_cache()
-            self.__class__.net2 = net2
 
 
 class PacUtil(object):
@@ -1708,8 +1691,6 @@ def main():
             GAEProxyHandler.net2 = ProxyNet2(common.PROXY_HOST, common.PROXY_PORT, common.PROXY_USERNAME, common.PROXY_PASSWROD)
         if common.PHP_ENABLE:
             PHPProxyHandler.net2 = ProxyNet2(common.PROXY_HOST, common.PROXY_PORT, common.PROXY_USERNAME, common.PROXY_PASSWROD)
-        if common.VPS_ENABLE:
-            VPSProxyHandler.net2 = ProxyNet2(common.PROXY_HOST, common.PROXY_PORT, common.PROXY_USERNAME, common.PROXY_PASSWROD)
 
     php_server = None
     if common.PHP_ENABLE:
@@ -1721,11 +1702,6 @@ def main():
     vps_server = None
     if common.VPS_ENABLE:
         host, port = common.VPS_LISTEN.split(':')
-        VPSProxyHandler.net2 = AdvancedNet2(window=2, ssl_version='SSLv23', dns_servers=common.DNS_SERVERS, dns_blacklist=common.DNS_BLACKLIST)
-        VPSProxyHandler.net2.enable_connection_cache()
-        VPSProxyHandler.net2.enable_connection_keepalive()
-        VPSProxyHandler.net2.enable_openssl_session_cache()
-        VPSProxyHandler.net2.openssl_context.set_cipher_list('RC4-MD5:RC4-SHA:!aNULL:!eNULL')
         VPSProxyHandler.handler_plugins['vps'] = VPSFetchPlugin(common.VPS_SERVERS)
         vps_server = LocalProxyServer((host, int(port)), VPSProxyHandler)
         thread.start_new_thread(vps_server.serve_forever, tuple())
@@ -1733,6 +1709,8 @@ def main():
     if common.GAE_ENABLE:
         if common.PHP_ENABLE:
             GAEProxyHandler.handler_plugins['php'] = php_server.RequestHandlerClass.handler_plugins['php']
+        if common.VPS_ENABLE:
+            GAEProxyHandler.handler_plugins['vps'] = vps_server.RequestHandlerClass.handler_plugins['vps']
         if os.name == 'nt':
             GAEProxyHandler.handler_plugins['strip'] = StripPluginEx()
         gae_server = LocalProxyServer((common.LISTEN_IP, common.LISTEN_PORT), GAEProxyHandler)

@@ -93,7 +93,7 @@ class TCPServer(gevent.server.StreamServer):
 
 
 class TLSServer(gevent.server.StreamServer):
-    """VPS tcp server"""
+    """VPS tls server"""
     def __init__(self, *args, **kwargs):
         self.password = kwargs.pop('password')
         self.ssl_context = generate_openssl_context(random_hostname())
